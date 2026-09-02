@@ -70,6 +70,14 @@ class MRIDataset(Dataset):
     mri_file_path columns); rows without an MRI are dropped automatically,
     so this naturally covers the same 298-patient subset used across
     Phases 4-6 for the imaging, EHR, and fused comparison.
+
+    For train/val splitting, filter cohort_df to one fold's patient_ids
+    (see folds.py) *before* constructing this Dataset -- e.g.
+    `MRIDataset(cohort_df[cohort_df.patient_id.isin(train_ids)])`. Never
+    construct one MRIDataset and split its items afterward: since each
+    patient contributes 115 consecutive slice-items, a post-hoc split
+    (by index, or any split not keyed on patient_id) risks putting some
+    of a patient's slices in train and others in validation.
     """
 
     def __init__(self, cohort_df: pd.DataFrame):
