@@ -1,0 +1,11 @@
+torch
+torchvision
+pytorch-lightning
+pandas
+numpy
+scikit-learn
+pydicom
+fhir.resources
+matplotlib
+gradio
+pytorch-grad-cam
