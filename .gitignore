@@ -1,4 +1,19 @@
-/data/
+/data/*
+!/data/processed/
+/data/processed/*
+# Phase 4 outputs are the exception: small CSVs worth committing so results
+# survive being generated on a throwaway Colab/Kaggle VM. Everything else
+# under data/ (raw dataset, patient_cohort.csv, patient_folds.csv, model
+# checkpoints) stays ignored -- a parent-directory ignore rule (the old
+# bare "/data/") can't be selectively un-ignored file-by-file in git, hence
+# ignoring contents (data/processed/*) rather than the directory itself.
+!/data/processed/mri_embeddings_fold0.csv
+!/data/processed/mri_embeddings_fold1.csv
+!/data/processed/mri_embeddings_fold2.csv
+!/data/processed/mri_embeddings_fold3.csv
+!/data/processed/mri_embeddings_fold4.csv
+!/data/processed/mri_baseline_metrics.csv
+
 *.ckpt
 *.pt
 *.pth

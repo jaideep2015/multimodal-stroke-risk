@@ -36,15 +36,21 @@ embedding would come from a model that never saw the *inputs* it's
 generated from as training data, but a *different* patient's fold
 assignment might not line up, silently breaking the split.
 
-Outputs (all under data/processed/, all gitignored):
+Outputs (all under data/processed/):
   - checkpoints/mri_fold{k}.pt          -- trained backbone+head weights
+                                            (gitignored -- large binaries
+                                            never get committed)
   - mri_embeddings_fold{k}.csv          -- pooled 512-dim embedding + prob
                                             for all 298 patients, tagged
                                             train/val for that fold
+                                            (committed -- see .gitignore's
+                                            explicit exception for these
+                                            5 files by name)
   - mri_baseline_metrics.csv            -- per-fold AUROC/sensitivity/
                                             specificity + the mean/std
                                             summary row Phase 9's README
                                             comparison table will use
+                                            (committed, same exception)
 
 Not this script's job: a final model trained on all 298 patients for
 deployment (Phase 8's concern) -- this script only produces the 5
