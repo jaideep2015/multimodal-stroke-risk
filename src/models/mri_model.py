@@ -55,6 +55,17 @@ Outputs (all under data/processed/):
 Not this script's job: a final model trained on all 298 patients for
 deployment (Phase 8's concern) -- this script only produces the 5
 fold-specific models needed for a fair CV comparison.
+
+Resumability: free Colab/Kaggle GPU sessions can disconnect mid-run, so
+each fold's checkpoint, embeddings CSV, and metrics row are all saved to
+disk immediately after that fold finishes -- not batched up and written
+once at the very end. A fold's embeddings CSV existing on disk is treated
+as proof that fold already completed; simply re-running the script skips
+straight past any such fold and picks up training from the first one
+that's still missing its output. To force a fold to redo from scratch,
+delete its mri_embeddings_fold{k}.csv (and, if you want a fresh checkpoint
+too, its mri_fold{k}.pt) before re-running. --smoke-test never persists
+anything, so it always runs regardless of what real output exists.
 """
 import argparse
 import logging
@@ -169,6 +180,24 @@ def extract_pooled_embeddings(
     return pooled, labels_by_patient
 
 
+def embeddings_path_for(fold: int, out_dir: Path) -> Path:
+    return out_dir / f"mri_embeddings_fold{fold}.csv"
+
+
+def save_fold_metrics(metrics_path: Path, fold_metrics: dict) -> None:
+    """Upsert one fold's row into the shared metrics CSV immediately, so a
+    fold's results survive even if the process is killed/disconnected
+    before the remaining folds finish. This is what main()'s resume check
+    reads back for folds it skips."""
+    if metrics_path.exists():
+        existing = pd.read_csv(metrics_path)
+        existing = existing[existing["fold"] != fold_metrics["fold"]]
+        updated = pd.concat([existing, pd.DataFrame([fold_metrics])], ignore_index=True)
+    else:
+        updated = pd.DataFrame([fold_metrics])
+    updated.sort_values("fold").reset_index(drop=True).to_csv(metrics_path, index=False)
+
+
 def run_fold(fold: int, mri_cohort: pd.DataFrame, folds_df: pd.DataFrame, args: argparse.Namespace) -> dict:
     torch.manual_seed(RANDOM_SEED)
     train_ids = set(patients_in_split(folds_df, fold, "train"))
@@ -211,6 +240,13 @@ def run_fold(fold: int, mri_cohort: pd.DataFrame, folds_df: pd.DataFrame, args: 
     sensitivity = tp / (tp + fn) if (tp + fn) else float("nan")
     specificity = tn / (tn + fp) if (tn + fp) else float("nan")
 
+    fold_metrics = {
+        "fold": fold,
+        "n_val": len(val_rows),
+        "auroc": auroc,
+        "sensitivity": sensitivity,
+        "specificity": specificity,
+    }
     logger.info(
         "Fold %d val metrics (n=%d): AUROC=%.3f sensitivity=%.3f specificity=%.3f",
         fold, len(val_rows), auroc, sensitivity, specificity,
@@ -221,9 +257,11 @@ def run_fold(fold: int, mri_cohort: pd.DataFrame, folds_df: pd.DataFrame, args: 
         checkpoint_dir = out_dir / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), checkpoint_dir / f"mri_fold{fold}.pt")
-        fold_df.to_csv(out_dir / f"mri_embeddings_fold{fold}.csv", index=False)
+        fold_df.to_csv(embeddings_path_for(fold, out_dir), index=False)
+        save_fold_metrics(out_dir / "mri_baseline_metrics.csv", fold_metrics)
+        logger.info("Fold %d: checkpoint, embeddings, and metrics row saved to disk.", fold)
 
-    return {"fold": fold, "n_val": len(val_rows), "auroc": auroc, "sensitivity": sensitivity, "specificity": specificity}
+    return fold_metrics
 
 
 def parse_args() -> argparse.Namespace:
@@ -252,15 +290,28 @@ def main() -> None:
         folds_to_run = folds_to_run[:1]
         args.epochs = 1
 
-    all_metrics = [run_fold(fold, mri_cohort, folds_df, args) for fold in folds_to_run]
+    out_dir = REPO_ROOT / "data" / "processed"
+    metrics_path = out_dir / "mri_baseline_metrics.csv"
 
-    metrics_df = pd.DataFrame(all_metrics)
-    logger.info("\n%s", metrics_df.to_string(index=False))
+    all_metrics = []
+    for fold in folds_to_run:
+        embeddings_path = embeddings_path_for(fold, out_dir)
+        if not args.smoke_test and embeddings_path.exists():
+            logger.info("Fold %d already completed (%s exists) -- skipping, not retraining.", fold, embeddings_path.name)
+            continue
+        all_metrics.append(run_fold(fold, mri_cohort, folds_df, args))
 
-    if not args.smoke_test:
-        summary = metrics_df[["auroc", "sensitivity", "specificity"]].agg(["mean", "std"])
-        logger.info("Summary across folds:\n%s", summary)
-        metrics_df.to_csv(REPO_ROOT / "data" / "processed" / "mri_baseline_metrics.csv", index=False)
+    if args.smoke_test:
+        logger.info("\n%s", pd.DataFrame(all_metrics).to_string(index=False))
+        return
+
+    # Read the metrics file back from disk rather than relying only on
+    # `all_metrics` -- any fold skipped above as already-done has its
+    # numbers on disk already, not in this run's in-memory list.
+    final_metrics_df = pd.read_csv(metrics_path) if metrics_path.exists() else pd.DataFrame(all_metrics)
+    logger.info("\n%s", final_metrics_df.to_string(index=False))
+    summary = final_metrics_df[["auroc", "sensitivity", "specificity"]].agg(["mean", "std"])
+    logger.info("Summary across folds:\n%s", summary)
 
 
 if __name__ == "__main__":
