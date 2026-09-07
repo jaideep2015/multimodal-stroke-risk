@@ -3,10 +3,10 @@
 /data/processed/*
 # Phase 4 outputs are the exception: small CSVs worth committing so results
 # survive being generated on a throwaway Colab/Kaggle VM. Everything else
-# under data/ (raw dataset, patient_cohort.csv, patient_folds.csv, model
-# checkpoints) stays ignored -- a parent-directory ignore rule (the old
-# bare "/data/") can't be selectively un-ignored file-by-file in git, hence
-# ignoring contents (data/processed/*) rather than the directory itself.
+# under data/ (the raw dataset, model checkpoints other than fold 0 below)
+# stays ignored -- a parent-directory ignore rule (the old bare "/data/")
+# can't be selectively un-ignored file-by-file in git, hence ignoring
+# contents (data/processed/*) rather than the directory itself.
 !/data/processed/mri_embeddings_fold0.csv
 !/data/processed/mri_embeddings_fold1.csv
 !/data/processed/mri_embeddings_fold2.csv
@@ -17,6 +17,15 @@
 !/data/processed/fusion_metrics.csv
 !/data/processed/fusion_late_metrics.csv
 !/data/processed/comparison_table.csv
+# patient_cohort.csv/patient_folds.csv were regenerate-only intermediates
+# through Phase 7, but Phase 8's app/gradio_app.py (via src/fusion/
+# inference.py) reads them directly at startup to fit the final EHR model
+# and compute out-of-fold imaging probabilities -- a real runtime
+# dependency now, not just a reproducibility convenience, so they're
+# committed too (confirmed missing by a fresh-clone test that reproduced
+# inference.py's FileNotFoundError before this exception was added).
+!/data/processed/patient_cohort.csv
+!/data/processed/patient_folds.csv
 
 *.ckpt
 *.pt
