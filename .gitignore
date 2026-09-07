@@ -30,4 +30,18 @@ env/
 *.egg-info/
 .pytest_cache/
 wandb/
-!data/processed/checkpoints/mri_fold0.pt
+
+# Checkpoints are gitignored by default (they're the large-binary case the
+# *.pt rule above exists for). mri_fold0.pt is a deliberate, named exception
+# for Grad-CAM (Phase 7) -- but it needs the same nested pattern as the
+# data/processed/ exceptions above: /data/processed/* (further up) already
+# matches "checkpoints" as a directory entry and stops git from recursing
+# into it at all, so a bare per-file negation here is silently ineffective
+# (this is exactly why committing it initially needed `git add -f`). Un-
+# ignoring the directory first, then re-ignoring its contents, then negating
+# just this one file is what actually works. This block must also stay
+# AFTER the *.pt rule above -- gitignore uses last-match-wins, so if this
+# came first, *.pt would still win and re-ignore the file.
+!/data/processed/checkpoints/
+/data/processed/checkpoints/*
+!/data/processed/checkpoints/mri_fold0.pt
