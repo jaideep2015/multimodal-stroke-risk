@@ -171,17 +171,42 @@ def _ehr_pipeline_with_classifier() -> Pipeline:
     ])
 
 
-def tune_late_fusion_weight(train_df: pd.DataFrame) -> float:
+def build_oof_imaging_probs(out_dir: Path, folds_df: pd.DataFrame) -> pd.Series:
+    """A genuinely out-of-fold imaging probability for every one of the
+    298 patients, sourced entirely from Phase 4's existing embeddings
+    files -- no CNN retraining involved.
+
+    Each patient is the *val* patient of exactly one outer fold (the 5
+    folds partition the cohort). That fold's CNN never trained on them,
+    so that fold's `prob` for them is already a legitimate holdout
+    prediction -- it's exactly what run_fold's own baseline metrics use.
+    Concatenating just the val-split rows across all 5 embeddings files
+    gives one lookup, indexed by patient_id, with zero in-sample entries
+    anywhere. This replaces the old (biased) approach of using a fold's
+    own train-split `prob` -- i.e. that fold's model scoring the same
+    patients it was fit on -- as a stand-in for a held-out estimate."""
+    available_folds = sorted(int(f) for f in folds_df["fold"].unique())
+    oof_frames = []
+    for fold in available_folds:
+        emb_df = pd.read_csv(out_dir / f"mri_embeddings_fold{fold}.csv")
+        oof_frames.append(emb_df.loc[emb_df["split"] == "val", ["patient_id", "prob"]])
+    oof_df = pd.concat(oof_frames, ignore_index=True)
+    if oof_df["patient_id"].duplicated().any():
+        raise ValueError("Each patient should appear in exactly one fold's val split")
+    return oof_df.set_index("patient_id")["prob"]
+
+
+def tune_late_fusion_weight(train_df: pd.DataFrame, oof_imaging_prob: pd.Series) -> float:
     """Pick alpha (the imaging-vs-EHR blend weight) using only this fold's
     training patients -- never the val patients being held out for
-    evaluation. The EHR side is cheap to refit, so its contribution here
-    is a genuine 5-fold-CV out-of-fold prediction (via cross_val_predict);
-    the imaging side is NOT refit (that would need the GPU again) -- its
-    already-computed `prob` column is reused as a fixed input, which is
-    fine here since alpha-tuning only needs relative rankings, not a
-    fresh model."""
+    evaluation. Both sides of the blend now use genuine out-of-fold
+    predictions: EHR via cross_val_predict (refit per inner fold), and
+    imaging via oof_imaging_prob (each patient's prediction from the one
+    outer fold that actually held them out) -- previously this used the
+    current outer fold's own in-sample train-set `prob`, which is
+    optimistic since that's the same model scoring patients it was fit on."""
     y_train = train_df["label"].values
-    imaging_prob_train = train_df["prob"].values
+    imaging_prob_train = train_df["patient_id"].map(oof_imaging_prob).values
     oof_ehr_prob = cross_val_predict(
         _ehr_pipeline_with_classifier(), train_df, y_train, cv=5, method="predict_proba"
     )[:, 1]
@@ -195,12 +220,12 @@ def tune_late_fusion_weight(train_df: pd.DataFrame) -> float:
     return best_alpha
 
 
-def run_late_fusion_fold(fold: int, cohort: pd.DataFrame, out_dir: Path) -> dict:
+def run_late_fusion_fold(fold: int, cohort: pd.DataFrame, out_dir: Path, oof_imaging_prob: pd.Series) -> dict:
     merged, _ = load_fold_data(fold, cohort, out_dir)
     train_df = merged[merged["split"] == "train"]
     val_df = merged[merged["split"] == "val"]
 
-    alpha = tune_late_fusion_weight(train_df)
+    alpha = tune_late_fusion_weight(train_df, oof_imaging_prob)
 
     ehr_pipeline = build_ehr_pipeline()
     X_ehr_train = ehr_pipeline.fit_transform(train_df)
@@ -209,7 +234,10 @@ def run_late_fusion_fold(fold: int, cohort: pd.DataFrame, out_dir: Path) -> dict
     clf.fit(X_ehr_train, train_df["label"].values)
     ehr_prob_val = clf.predict_proba(X_ehr_val)[:, 1]
 
-    imaging_prob_val = val_df["prob"].values  # already out-of-fold w.r.t. this outer split (Phase 4)
+    # equivalent to val_df["prob"] (fold k's val patients ARE fold k's oof
+    # patients by construction) -- sourced from the same lookup as the
+    # training side for one single, provably-consistent source of truth
+    imaging_prob_val = val_df["patient_id"].map(oof_imaging_prob).values
     y_val = val_df["label"].values
     blended_val = alpha * imaging_prob_val + (1 - alpha) * ehr_prob_val
 
@@ -276,7 +304,8 @@ def main() -> None:
     joint_df.to_csv(out_dir / "fusion_metrics.csv", index=False)
 
     logger.info("=== Late fusion (weighted average of model probabilities) ===")
-    late_metrics = [run_late_fusion_fold(fold, mri_cohort, out_dir) for fold in available_folds]
+    oof_imaging_prob = build_oof_imaging_probs(out_dir, folds_df)
+    late_metrics = [run_late_fusion_fold(fold, mri_cohort, out_dir, oof_imaging_prob) for fold in available_folds]
     late_df = pd.DataFrame(late_metrics)
     logger.info("\n%s", late_df.to_string(index=False))
     logger.info("Summary across folds:\n%s", late_df[["auroc", "sensitivity", "specificity"]].agg(["mean", "std"]))
