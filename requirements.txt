@@ -8,4 +8,4 @@ pydicom
 fhir.resources
 matplotlib
 gradio
-pytorch-grad-cam
+grad-cam
