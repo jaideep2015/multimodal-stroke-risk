@@ -284,7 +284,10 @@ def main() -> None:
     folds_df = load_patient_folds(REPO_ROOT / "data" / "processed" / "patient_folds.csv")
     mri_cohort = cohort[cohort["patient_id"].isin(folds_df["patient_id"])].reset_index(drop=True)
 
-    available_folds = sorted(folds_df["fold"].unique())
+    # cast to plain int -- folds_df["fold"] loads as float64 from CSV, and an
+    # uncast float would leak a ".0" into every filename built below
+    # (mri_fold0.0.pt, mri_embeddings_fold0.0.csv, etc.)
+    available_folds = sorted(int(f) for f in folds_df["fold"].unique())
     folds_to_run = [int(f) for f in args.folds.split(",")] if args.folds else available_folds
     if args.smoke_test:
         folds_to_run = folds_to_run[:1]
