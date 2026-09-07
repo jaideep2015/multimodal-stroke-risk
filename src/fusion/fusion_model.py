@@ -1,9 +1,25 @@
 """
-Phase 6: fusion model. Concatenates each patient's MRI image embedding
-with their EHR feature vector into one joint classifier -- the "joint
-fusion" architecture named in CLAUDE.md. This produces the headline
-result: imaging-only vs. EHR-only vs. fused, evaluated identically across
-all three via the same 5-fold patient-level CV (patient_folds.csv).
+Phase 6: fusion models. Two alternatives, both evaluated identically
+across the same 5-fold patient-level CV (patient_folds.csv):
+
+1. JOINT fusion (run_fold): concatenates each patient's MRI image
+   embedding with their EHR feature vector into one classifier -- the
+   "joint fusion" architecture named in CLAUDE.md.
+2. LATE fusion (run_late_fusion_fold): trains no new classifier over
+   concatenated features at all. Instead it takes the imaging-only and
+   EHR-only MODELS' predicted probabilities and blends them with a
+   single tuned weight, alpha * imaging_prob + (1 - alpha) * ehr_prob.
+   Added specifically to test whether joint fusion's inability to beat
+   the EHR-only baseline is a limitation of concatenation itself (a
+   linear classifier over concatenated features has no way to partially
+   discount a noisy branch -- every input gets folded into one weight
+   vector) rather than a limitation of combining these two modalities at
+   all. Late fusion CAN discount a noisy branch: if alpha tunes toward 0,
+   that's the model explicitly learning "ignore imaging, trust EHR."
+
+Both approaches are cheap and require no GPU/retraining of the CNN --
+they only ever consume Phase 4's already-computed embeddings/probabilities
+and cheaply-refittable EHR models on CPU.
 
 Per fold, two inputs get merged by patient_id (never assumed to already
 be in matching row order -- see load_fold_data):
@@ -41,12 +57,16 @@ over [EHR features, PCA-reduced embedding] is more defensible than a
 higher-capacity network that would just overfit this little data.
 
 Outputs:
-  - data/processed/fusion_metrics.csv     -- same columns as Phase 4/5's
-                                              baseline metrics files
-  - data/processed/comparison_table.csv   -- the headline imaging-only
-                                              vs. EHR-only vs. fused
-                                              comparison, mean +/- std
-                                              per model across folds
+  - data/processed/fusion_metrics.csv       -- joint fusion, per fold
+  - data/processed/fusion_late_metrics.csv  -- late fusion, per fold
+                                                (same columns as the
+                                                baseline metrics files,
+                                                plus the tuned `alpha`)
+  - data/processed/comparison_table.csv     -- the headline four-way
+                                                comparison (imaging-only,
+                                                EHR-only, joint fusion,
+                                                late fusion), mean +/- std
+                                                per model across folds
 """
 import logging
 import sys
@@ -57,6 +77,7 @@ import pandas as pd
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import confusion_matrix, roc_auc_score
+from sklearn.model_selection import cross_val_predict
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -83,12 +104,13 @@ def build_embedding_reducer() -> Pipeline:
 
 def load_fold_data(fold: int, cohort: pd.DataFrame, out_dir: Path) -> tuple[pd.DataFrame, list]:
     """One row per patient (this fold's 298), with EHR raw fields, split,
-    label, and this fold's embedding columns all aligned by an explicit
-    patient_id merge -- row order from the CSV or from `cohort` is never
+    label, this fold's embedding columns, AND the imaging model's own
+    `prob` column (needed by late fusion) -- all aligned by an explicit
+    patient_id merge. Row order from the CSV or from `cohort` is never
     assumed to already match between the two sources."""
     emb_df = pd.read_csv(out_dir / f"mri_embeddings_fold{fold}.csv")
     emb_cols = [c for c in emb_df.columns if c.startswith("emb_")]
-    merged = cohort.merge(emb_df[["patient_id", "split"] + emb_cols], on="patient_id", how="inner")
+    merged = cohort.merge(emb_df[["patient_id", "split", "prob"] + emb_cols], on="patient_id", how="inner")
     if len(merged) != len(emb_df):
         raise ValueError(
             f"Fold {fold}: merge lost patients (cohort={len(cohort)}, "
@@ -139,14 +161,86 @@ def run_fold(fold: int, cohort: pd.DataFrame, out_dir: Path) -> dict:
     }
 
 
+def _ehr_pipeline_with_classifier() -> Pipeline:
+    """EHR preprocessing + classifier as one Pipeline, so cross_val_predict
+    below refits imputation/scaling fresh within each inner fold instead of
+    leaking outer-train-wide statistics into the inner split it's tuning on."""
+    return Pipeline([
+        ("features", build_ehr_pipeline()),
+        ("clf", LogisticRegression(max_iter=1000, class_weight="balanced", random_state=RANDOM_SEED)),
+    ])
+
+
+def tune_late_fusion_weight(train_df: pd.DataFrame) -> float:
+    """Pick alpha (the imaging-vs-EHR blend weight) using only this fold's
+    training patients -- never the val patients being held out for
+    evaluation. The EHR side is cheap to refit, so its contribution here
+    is a genuine 5-fold-CV out-of-fold prediction (via cross_val_predict);
+    the imaging side is NOT refit (that would need the GPU again) -- its
+    already-computed `prob` column is reused as a fixed input, which is
+    fine here since alpha-tuning only needs relative rankings, not a
+    fresh model."""
+    y_train = train_df["label"].values
+    imaging_prob_train = train_df["prob"].values
+    oof_ehr_prob = cross_val_predict(
+        _ehr_pipeline_with_classifier(), train_df, y_train, cv=5, method="predict_proba"
+    )[:, 1]
+
+    best_alpha, best_auroc = 0.0, -np.inf
+    for alpha in np.linspace(0, 1, 21):
+        blended = alpha * imaging_prob_train + (1 - alpha) * oof_ehr_prob
+        auroc = roc_auc_score(y_train, blended)
+        if auroc > best_auroc:
+            best_alpha, best_auroc = alpha, auroc
+    return best_alpha
+
+
+def run_late_fusion_fold(fold: int, cohort: pd.DataFrame, out_dir: Path) -> dict:
+    merged, _ = load_fold_data(fold, cohort, out_dir)
+    train_df = merged[merged["split"] == "train"]
+    val_df = merged[merged["split"] == "val"]
+
+    alpha = tune_late_fusion_weight(train_df)
+
+    ehr_pipeline = build_ehr_pipeline()
+    X_ehr_train = ehr_pipeline.fit_transform(train_df)
+    X_ehr_val = ehr_pipeline.transform(val_df)
+    clf = LogisticRegression(max_iter=1000, class_weight="balanced", random_state=RANDOM_SEED)
+    clf.fit(X_ehr_train, train_df["label"].values)
+    ehr_prob_val = clf.predict_proba(X_ehr_val)[:, 1]
+
+    imaging_prob_val = val_df["prob"].values  # already out-of-fold w.r.t. this outer split (Phase 4)
+    y_val = val_df["label"].values
+    blended_val = alpha * imaging_prob_val + (1 - alpha) * ehr_prob_val
+
+    auroc = roc_auc_score(y_val, blended_val)
+    val_preds = (blended_val >= 0.5).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_val, val_preds, labels=[0, 1]).ravel()
+    sensitivity = tp / (tp + fn) if (tp + fn) else float("nan")
+    specificity = tn / (tn + fp) if (tn + fp) else float("nan")
+
+    logger.info(
+        "Fold %d late-fusion val metrics (n=%d, alpha=%.2f): AUROC=%.3f sensitivity=%.3f specificity=%.3f",
+        fold, len(val_df), alpha, auroc, sensitivity, specificity,
+    )
+    return {
+        "fold": fold,
+        "n_val": len(val_df),
+        "alpha": alpha,
+        "auroc": auroc,
+        "sensitivity": sensitivity,
+        "specificity": specificity,
+    }
+
+
 def build_comparison_table(out_dir: Path) -> pd.DataFrame:
-    """Combine Phase 4/5/6's per-fold metrics into the headline
-    imaging-only vs. EHR-only vs. fused comparison: mean +/- std per model
-    across the 5 folds."""
+    """Combine Phase 4/5/6's per-fold metrics into the headline four-way
+    comparison: mean +/- std per model across the 5 folds."""
     tables = {
         "imaging-only": pd.read_csv(out_dir / "mri_baseline_metrics.csv"),
         "ehr-only": pd.read_csv(out_dir / "ehr_baseline_metrics.csv"),
-        "fused": pd.read_csv(out_dir / "fusion_metrics.csv"),
+        "joint-fusion": pd.read_csv(out_dir / "fusion_metrics.csv"),
+        "late-fusion": pd.read_csv(out_dir / "fusion_late_metrics.csv"),
     }
     rows = []
     for model_name, df in tables.items():
@@ -173,16 +267,26 @@ def main() -> None:
     # cast to plain int -- folds_df["fold"] loads as float64 from CSV, and
     # mri_embeddings_fold{fold}.csv filenames don't carry a ".0" suffix
     available_folds = sorted(int(f) for f in folds_df["fold"].unique())
-    all_metrics = [run_fold(fold, mri_cohort, out_dir) for fold in available_folds]
 
-    metrics_df = pd.DataFrame(all_metrics)
-    logger.info("\n%s", metrics_df.to_string(index=False))
-    summary = metrics_df[["auroc", "sensitivity", "specificity"]].agg(["mean", "std"])
-    logger.info("Summary across folds:\n%s", summary)
-    metrics_df.to_csv(out_dir / "fusion_metrics.csv", index=False)
+    logger.info("=== Joint fusion (concatenated features) ===")
+    joint_metrics = [run_fold(fold, mri_cohort, out_dir) for fold in available_folds]
+    joint_df = pd.DataFrame(joint_metrics)
+    logger.info("\n%s", joint_df.to_string(index=False))
+    logger.info("Summary across folds:\n%s", joint_df[["auroc", "sensitivity", "specificity"]].agg(["mean", "std"]))
+    joint_df.to_csv(out_dir / "fusion_metrics.csv", index=False)
+
+    logger.info("=== Late fusion (weighted average of model probabilities) ===")
+    late_metrics = [run_late_fusion_fold(fold, mri_cohort, out_dir) for fold in available_folds]
+    late_df = pd.DataFrame(late_metrics)
+    logger.info("\n%s", late_df.to_string(index=False))
+    logger.info("Summary across folds:\n%s", late_df[["auroc", "sensitivity", "specificity"]].agg(["mean", "std"]))
+    late_df.to_csv(out_dir / "fusion_late_metrics.csv", index=False)
 
     comparison = build_comparison_table(out_dir)
-    logger.info("\n=== Headline comparison: imaging-only vs EHR-only vs fused ===\n%s", comparison.to_string(index=False))
+    logger.info(
+        "\n=== Headline comparison: imaging-only vs EHR-only vs joint-fusion vs late-fusion ===\n%s",
+        comparison.to_string(index=False),
+    )
     comparison.to_csv(out_dir / "comparison_table.csv", index=False)
 
 

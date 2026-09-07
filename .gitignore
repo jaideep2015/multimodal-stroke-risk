@@ -13,6 +13,10 @@
 !/data/processed/mri_embeddings_fold3.csv
 !/data/processed/mri_embeddings_fold4.csv
 !/data/processed/mri_baseline_metrics.csv
+!/data/processed/ehr_baseline_metrics.csv
+!/data/processed/fusion_metrics.csv
+!/data/processed/fusion_late_metrics.csv
+!/data/processed/comparison_table.csv
 
 *.ckpt
 *.pt
