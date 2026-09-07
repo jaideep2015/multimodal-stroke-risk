@@ -30,3 +30,4 @@ env/
 *.egg-info/
 .pytest_cache/
 wandb/
+!data/processed/checkpoints/mri_fold0.pt
